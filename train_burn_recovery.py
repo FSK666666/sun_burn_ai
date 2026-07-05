@@ -59,11 +59,19 @@ class TrainConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     use_amp: bool = True
+    grad_clip_norm: float = 1.0
 
     base_channels: int = 32
     p_loss_weight: float = 1.0
-    c_loss_weight: float = 1.0
-    c_active_loss_weight: float = 4.0
+    c_active_loss_weight: float = 1.0
+    c_bg_loss_weight: float = 0.10
+    c_global_loss_weight: float = 0.20
+    gradient_loss_weight: float = 0.10
+    dice_loss_weight: float = 0.50
+    focal_alpha: float = 0.25
+    focal_gamma: float = 2.0
+    mask_threshold: float = 8.0 / 255.0
+    background_change_threshold: float = 1.0 / 255.0
 
     temporal_scale_range: tuple[float, float] = (0.92, 1.08)
     train_no_burn_probability: float = 0.15
@@ -128,6 +136,7 @@ class BurnRecoveryDataset(Dataset):
         no_burn_probability: float = 0.0,
         no_burn_seed: int = 0,
         deterministic_no_burn: bool = False,
+        mask_threshold: float = 8.0 / 255.0,
     ):
         self.root = Path(root)
         self.image_size = image_size
@@ -136,6 +145,7 @@ class BurnRecoveryDataset(Dataset):
         self.no_burn_probability = float(no_burn_probability)
         self.no_burn_seed = int(no_burn_seed)
         self.deterministic_no_burn = deterministic_no_burn
+        self.mask_threshold = float(mask_threshold)
 
         if not self.root.is_dir():
             raise FileNotFoundError(f"Dataset root not found: {self.root}")
@@ -230,14 +240,18 @@ class BurnRecoveryDataset(Dataset):
         _, h, w = clean.shape
 
         if self._use_no_burn_sample(index):
-            correction = np.zeros((h, w), dtype=np.float32)
+            raw_correction = np.zeros((h, w), dtype=np.float32)
         else:
-            correction = self._load_burn_trace(sample_dir, (h, w))
-        mask = (correction > 0).astype(np.float32)
+            raw_correction = self._load_burn_trace(sample_dir, (h, w))
+        mask = (raw_correction >= self.mask_threshold).astype(np.float32)
 
         low, high = self.temporal_scale_range
         scales = np.random.uniform(low, high, size=(5, 1, 1)).astype(np.float32)
-        burned = np.clip(clean + correction[None, :, :] * scales, 0.0, 1.0)
+        scaled_correction = raw_correction[None, :, :] * scales
+        effective_correction = np.minimum(scaled_correction, 1.0 - clean)
+        effective_correction = np.maximum(effective_correction, 0.0).astype(np.float32)
+        burned = np.clip(clean + effective_correction, 0.0, 1.0)
+        correction = np.median(effective_correction, axis=0).astype(np.float32)
 
         return {
             "x": torch.from_numpy(burned).float(),
@@ -248,31 +262,150 @@ class BurnRecoveryDataset(Dataset):
         }
 
 
-def compute_loss(
+def focal_loss_with_logits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 0.25,
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    bce = nn.functional.binary_cross_entropy_with_logits(
+        logits,
+        target,
+        reduction="none",
+    )
+    prob = torch.sigmoid(logits)
+    p_t = prob * target + (1.0 - prob) * (1.0 - target)
+    alpha_t = alpha * target + (1.0 - alpha) * (1.0 - target)
+    return (alpha_t * (1.0 - p_t).pow(gamma) * bce).mean()
+
+
+def dice_loss(
     prob: torch.Tensor,
+    target: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    dims = (1, 2, 3)
+    intersection = (prob * target).sum(dim=dims)
+    union = prob.sum(dim=dims) + target.sum(dim=dims)
+    dice = (2.0 * intersection + eps) / (union + eps)
+    return 1.0 - dice.mean()
+
+
+def gradient_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    pred_dx = pred[..., :, 1:] - pred[..., :, :-1]
+    pred_dy = pred[..., 1:, :] - pred[..., :-1, :]
+    target_dx = target[..., :, 1:] - target[..., :, :-1]
+    target_dy = target[..., 1:, :] - target[..., :-1, :]
+    return (
+        nn.functional.l1_loss(pred_dx, target_dx)
+        + nn.functional.l1_loss(pred_dy, target_dy)
+    )
+
+
+def compute_loss(
+    prob_logits: torch.Tensor,
     correction: torch.Tensor,
     p_target: torch.Tensor,
     c_target: torch.Tensor,
     cfg: TrainConfig,
 ):
-    bce = nn.functional.binary_cross_entropy(prob, p_target)
-    l1_all = nn.functional.l1_loss(correction, c_target)
+    prob = torch.sigmoid(prob_logits)
+    loss_focal = focal_loss_with_logits(
+        prob_logits,
+        p_target,
+        alpha=cfg.focal_alpha,
+        gamma=cfg.focal_gamma,
+    )
+    loss_dice = dice_loss(prob, p_target)
+    loss_prob = loss_focal + cfg.dice_loss_weight * loss_dice
 
+    error = torch.abs(correction - c_target)
     active = p_target > 0.5
+    background = ~active
+
     if active.any():
-        l1_active = nn.functional.l1_loss(correction[active], c_target[active])
+        l1_active = error[active].mean()
     else:
         l1_active = correction.new_tensor(0.0)
 
+    if background.any():
+        l1_bg = torch.abs(correction[background]).mean()
+    else:
+        l1_bg = correction.new_tensor(0.0)
+
+    l1_global = error.mean()
+    grad = gradient_l1(correction, c_target)
+
     loss = (
-        cfg.p_loss_weight * bce
-        + cfg.c_loss_weight * l1_all
+        cfg.p_loss_weight * loss_prob
         + cfg.c_active_loss_weight * l1_active
+        + cfg.c_bg_loss_weight * l1_bg
+        + cfg.c_global_loss_weight * l1_global
+        + cfg.gradient_loss_weight * grad
     )
     return loss, {
-        "bce": float(bce.detach().cpu()),
-        "l1_all": float(l1_all.detach().cpu()),
+        "loss_prob": float(loss_prob.detach().cpu()),
+        "focal": float(loss_focal.detach().cpu()),
+        "dice_loss": float(loss_dice.detach().cpu()),
         "l1_active": float(l1_active.detach().cpu()),
+        "l1_bg": float(l1_bg.detach().cpu()),
+        "l1_global": float(l1_global.detach().cpu()),
+        "gradient": float(grad.detach().cpu()),
+    }
+
+
+@torch.no_grad()
+def compute_metrics(
+    prob: torch.Tensor,
+    correction: torch.Tensor,
+    p_target: torch.Tensor,
+    c_target: torch.Tensor,
+    cfg: TrainConfig,
+) -> dict[str, float]:
+    pred_mask = prob >= 0.5
+    target_mask = p_target > 0.5
+    background = ~target_mask
+    eps = 1e-6
+
+    tp = (pred_mask & target_mask).sum().float()
+    fp = (pred_mask & background).sum().float()
+    fn = ((~pred_mask) & target_mask).sum().float()
+
+    precision_den = tp + fp
+    recall_den = tp + fn
+    overlap_den = tp + fp + fn
+    dice_den = 2.0 * tp + fp + fn
+    precision = torch.where(precision_den > 0, tp / (precision_den + eps), torch.ones_like(tp))
+    recall = torch.where(recall_den > 0, tp / (recall_den + eps), torch.ones_like(tp))
+    f1 = 2.0 * precision * recall / (precision + recall + eps)
+    iou = torch.where(overlap_den > 0, tp / (overlap_den + eps), torch.ones_like(tp))
+    dice = torch.where(dice_den > 0, 2.0 * tp / (dice_den + eps), torch.ones_like(tp))
+
+    error = torch.abs(correction - c_target)
+    if target_mask.any():
+        active_mae = error[target_mask].mean()
+        active_rmse = torch.sqrt(torch.mean((correction[target_mask] - c_target[target_mask]).pow(2)))
+    else:
+        active_mae = correction.new_tensor(0.0)
+        active_rmse = correction.new_tensor(0.0)
+
+    if background.any():
+        bg_mae = torch.abs(correction[background]).mean()
+        bg_changed = (torch.abs(correction[background]) > cfg.background_change_threshold).float().mean()
+    else:
+        bg_mae = correction.new_tensor(0.0)
+        bg_changed = correction.new_tensor(0.0)
+
+    return {
+        "precision": float(precision.detach().cpu()),
+        "recall": float(recall.detach().cpu()),
+        "f1": float(f1.detach().cpu()),
+        "dice": float(dice.detach().cpu()),
+        "iou": float(iou.detach().cpu()),
+        "active_mae": float(active_mae.detach().cpu()),
+        "active_rmse": float(active_rmse.detach().cpu()),
+        "bg_mae": float(bg_mae.detach().cpu()),
+        "bg_changed": float(bg_changed.detach().cpu()),
     }
 
 
@@ -287,9 +420,8 @@ def run_one_epoch(
     is_train = optimizer is not None
     model.train(is_train)
     total_loss = 0.0
-    total_bce = 0.0
-    total_l1 = 0.0
-    total_active = 0.0
+    total_parts: dict[str, float] = {}
+    total_metrics: dict[str, float] = {}
     n_batches = 0
 
     total_batches = len(loader)
@@ -307,26 +439,34 @@ def run_one_epoch(
         )
 
         with torch.set_grad_enabled(is_train), autocast_context:
-            prob, correction = model(x)
+            prob_logits, correction = model(x)
 
-        prob = prob.float()
+        prob_logits = prob_logits.float()
+        prob = torch.sigmoid(prob_logits)
         correction = correction.float()
-        loss, parts = compute_loss(prob, correction, p_target, c_target, cfg)
+        loss, parts = compute_loss(prob_logits, correction, p_target, c_target, cfg)
+        metrics = compute_metrics(prob, correction, p_target, c_target, cfg)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None and amp_enabled:
                 scaler.scale(loss).backward()
+                if cfg.grad_clip_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                if cfg.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
                 optimizer.step()
 
         total_loss += float(loss.detach().cpu())
-        total_bce += parts["bce"]
-        total_l1 += parts["l1_all"]
-        total_active += parts["l1_active"]
+        for key, value in parts.items():
+            total_parts[key] = total_parts.get(key, 0.0) + value
+        for key, value in metrics.items():
+            total_metrics[key] = total_metrics.get(key, 0.0) + value
         n_batches += 1
 
         if (
@@ -340,12 +480,11 @@ def run_one_epoch(
                 flush=True,
             )
 
-    return {
-        "loss": total_loss / max(n_batches, 1),
-        "bce": total_bce / max(n_batches, 1),
-        "l1_all": total_l1 / max(n_batches, 1),
-        "l1_active": total_active / max(n_batches, 1),
-    }
+    denom = max(n_batches, 1)
+    result = {"loss": total_loss / denom}
+    result.update({key: value / denom for key, value in total_parts.items()})
+    result.update({key: value / denom for key, value in total_metrics.items()})
+    return result
 
 
 def save_checkpoint(
@@ -412,7 +551,8 @@ def save_visualizations(
         c_target = batch["c"].to(device, non_blocking=True)
         samples = batch["sample"]
 
-        prob, correction = model(x)
+        prob_logits, correction = model(x)
+        prob = torch.sigmoid(prob_logits)
         restored = torch.clamp(x[:, -1:, :, :] - (prob > 0.5).float() * correction, 0.0, 1.0)
 
         batch_size = x.shape[0]
@@ -457,6 +597,7 @@ def main():
         no_burn_probability=cfg.train_no_burn_probability,
         no_burn_seed=cfg.seed,
         deterministic_no_burn=False,
+        mask_threshold=cfg.mask_threshold,
     )
     val_dataset = BurnRecoveryDataset(
         root=cfg.val_root,
@@ -467,6 +608,7 @@ def main():
         no_burn_probability=cfg.val_no_burn_probability,
         no_burn_seed=cfg.val_subset_seed,
         deterministic_no_burn=True,
+        mask_threshold=cfg.mask_threshold,
     )
     full_val_samples = len(val_dataset)
     val_dataset = make_fixed_random_subset(
@@ -509,6 +651,8 @@ def main():
     print(f"amp: {bool(cfg.use_amp and device.type == 'cuda')}")
     print(f"train no-burn probability: {cfg.train_no_burn_probability}")
     print(f"val no-burn probability: {cfg.val_no_burn_probability}")
+    print(f"mask threshold: {cfg.mask_threshold:.6f}")
+    print(f"grad clip norm: {cfg.grad_clip_norm}")
 
     writer = None
     if cfg.use_tensorboard:
@@ -530,8 +674,10 @@ def main():
             f"time={elapsed:.1f}s "
             f"train_loss={train_metrics['loss']:.5f} "
             f"val_loss={val_metrics['loss']:.5f} "
-            f"val_bce={val_metrics['bce']:.5f} "
-            f"val_l1_active={val_metrics['l1_active']:.5f}"
+            f"val_dice={val_metrics['dice']:.5f} "
+            f"val_iou={val_metrics['iou']:.5f} "
+            f"val_active_mae={val_metrics['active_mae']:.5f} "
+            f"val_bg_mae={val_metrics['bg_mae']:.5f}"
         )
 
         if writer is not None:

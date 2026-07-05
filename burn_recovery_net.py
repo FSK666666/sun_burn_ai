@@ -8,8 +8,8 @@
     x: [B, 5, H, W]，历史 5 帧灰度红外图像。
 
 输出:
-    P: [B, 1, H, W]，灼烧概率图，范围 0~1。
-    C: [B, 1, H, W]，有效偏置纠正图，表示应从未来帧中减去的偏置强度。
+    P_logits: [B, 1, H, W]，灼烧概率 logits，使用时再 sigmoid。
+    C: [B, 1, H, W]，有效偏置纠正图，范围 0~1。
 
 推理用法:
     future_restored = future_frame - C
@@ -148,7 +148,6 @@ class BurnRecoveryNet(nn.Module):
         self.correction_head = nn.Sequential(
             DepthwiseSeparableConv(c1, c1),
             nn.Conv2d(c1, 1, kernel_size=1),
-            nn.ReLU(inplace=True),
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -163,9 +162,9 @@ class BurnRecoveryNet(nn.Module):
         y = self.dec1(z, s2)
         y = self.dec2(y, s1)
 
-        prob = torch.sigmoid(self.prob_head(y))
-        correction = self.correction_head(y)
-        return prob, correction
+        prob_logits = self.prob_head(y)
+        correction = torch.sigmoid(self.correction_head(y))
+        return prob_logits, correction
 
 
 def restore_future_frame(
@@ -173,6 +172,7 @@ def restore_future_frame(
     prob: torch.Tensor,
     correction: torch.Tensor,
     threshold: float | None = 0.5,
+    prob_is_logits: bool = False,
 ) -> torch.Tensor:
     """
     使用网络输出恢复未来帧。
@@ -189,6 +189,9 @@ def restore_future_frame(
         future_frame = future_frame.unsqueeze(1)
         squeeze_back = True
 
+    if prob_is_logits:
+        prob = torch.sigmoid(prob)
+
     if threshold is None:
         restored = future_frame - correction
     else:
@@ -202,6 +205,8 @@ def restore_future_frame(
 if __name__ == "__main__":
     model = BurnRecoveryNet(in_frames=5, base_channels=32)
     x = torch.randn(2, 5, 256, 320)
-    p, c = model(x)
+    logits, c = model(x)
+    p = torch.sigmoid(logits)
+    print("P logits:", tuple(logits.shape), logits.min().item(), logits.max().item())
     print("P:", tuple(p.shape), p.min().item(), p.max().item())
     print("C:", tuple(c.shape), c.min().item(), c.max().item())

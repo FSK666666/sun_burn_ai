@@ -251,8 +251,8 @@ x: [B, 5, H, W]
 输出：
 
 ```text
-P: [B, 1, H, W]，灼烧概率图，经过 sigmoid，范围 0~1
-C: [B, 1, H, W]，灼烧强度图，经过 ReLU，非负
+P_logits: [B, 1, H, W]，灼烧概率 logits，训练时用于 Focal/BCEWithLogits 类损失
+C: [B, 1, H, W]，灼烧有效偏置强度图，经过 sigmoid，范围 0~1
 ```
 
 结构概要：
@@ -313,8 +313,15 @@ use_amp = True
 
 base_channels = 32
 p_loss_weight = 1.0
-c_loss_weight = 1.0
-c_active_loss_weight = 4.0
+c_active_loss_weight = 1.0
+c_bg_loss_weight = 0.10
+c_global_loss_weight = 0.20
+gradient_loss_weight = 0.10
+dice_loss_weight = 0.50
+focal_alpha = 0.25
+focal_gamma = 2.0
+mask_threshold = 8.0 / 255.0
+background_change_threshold = 1.0 / 255.0
 
 temporal_scale_range = (0.92, 1.08)
 train_no_burn_probability = 0.15
@@ -360,13 +367,16 @@ synthetic_burn_trace.npy
 ```python
 clean = frame / 255.0
 correction = synthetic_burn_trace / 255.0
-mask = correction > 0
+mask = correction >= (8.0 / 255.0)
 ```
 
-输入网络前，会把灼烧加到干净图上：
+输入网络前，会把灼烧加到干净图上。为了避免 8 bit 图像饱和导致“标签要求网络预测不可见亮度”的问题，当前训练标签使用实际可见的有效偏置：
 
 ```python
-burned = clean + correction * temporal_scale
+scaled = correction[None, :, :] * temporal_scale
+effective = np.minimum(scaled, 1.0 - clean)
+burned = clean + effective
+c_target = np.median(effective, axis=0)
 ```
 
 其中训练集 temporal scale 在 `(0.92, 1.08)` 随机变化，验证集固定为 `(1.0, 1.0)`。
@@ -393,24 +403,32 @@ burned = clean
 总损失：
 
 ```text
-loss = BCE(P, mask)
-     + L1(C, burn_trace)
-     + 4 * L1(C_active, burn_trace_active)
+loss = FocalWithLogits(P_logits, mask)
+     + 0.5 * Dice(sigmoid(P_logits), mask)
+     + 1.0 * L1(C_active, C_target_active)
+     + 0.10 * L1(C_background, 0)
+     + 0.20 * L1(C, C_target)
+     + 0.10 * GradientL1(C, C_target)
 ```
 
 对应代码：
 
 ```python
-bce = binary_cross_entropy(prob, p_target)
-l1_all = l1_loss(correction, c_target)
-l1_active = l1_loss(correction[active], c_target[active])
+loss_focal = focal_loss_with_logits(prob_logits, p_target)
+loss_dice = dice_loss(torch.sigmoid(prob_logits), p_target)
+l1_active = abs(correction - c_target)[active].mean()
+l1_bg = abs(correction[background]).mean()
+l1_global = abs(correction - c_target).mean()
+loss_gradient = gradient_l1(correction, c_target)
 ```
 
 含义：
 
-- `BCE(P, mask)`：监督网络找出灼烧区域。
-- `L1(C, burn_trace)`：监督网络预测整幅图上的灼烧强度。
-- `更高权重的灼烧区域 L1`：让网络更关注真实灼烧区域，而不是被大量背景像素稀释。
+- `FocalWithLogits + Dice`：缓解灼烧区域小、背景像素多导致的类别不平衡。
+- `active L1`：重点监督灼烧区域内的有效偏置强度。
+- `background L1`：约束无灼烧背景不要被错误修复。
+- `global L1`：保持整幅图的偏置估计稳定。
+- `GradientL1`：让预测偏置图的边缘形状更接近标签。
 
 ### 8.3 验证集抽样
 
@@ -424,6 +442,26 @@ val_subset_seed = 20260705
 这 500 个样本在训练开始时确定，每个 epoch 都相同，因此验证 loss 可比较，同时节省时间。
 
 测试集 `test` 和 `test_flir` 不在训练循环中每 epoch 运行。建议训练完成后用 `best.pt` 单独完整测试。
+
+训练完成后可运行独立评估脚本：
+
+```powershell
+python test_burn_recovery.py --checkpoint C:\Users\17874\Documents\python\checkpoints\burn_recovery\best.pt
+```
+
+默认会依次评估：
+
+```text
+datasets\burn_recovery\val
+datasets\burn_recovery\test
+datasets\burn_recovery\test_flir
+```
+
+默认不临时生成缺失的灼烧标签，以保证测试可复现。如果确实需要临时生成，可加：
+
+```powershell
+python test_burn_recovery.py --generate-missing-burn
+```
 
 ### 8.4 训练进度
 
@@ -450,7 +488,7 @@ val batch 50/84 loss=...
 每个 epoch 结束打印：
 
 ```text
-epoch 001/30 time=...s train_loss=... val_loss=... val_bce=... val_l1_active=...
+epoch 001/30 time=...s train_loss=... val_loss=... val_dice=... val_iou=... val_active_mae=... val_bg_mae=...
 ```
 
 ### 8.5 输出文件
@@ -496,13 +534,29 @@ http://localhost:6006
 可以查看：
 
 - `train/loss`
-- `train/bce`
-- `train/l1_all`
+- `train/loss_prob`
+- `train/focal`
+- `train/dice_loss`
 - `train/l1_active`
+- `train/l1_bg`
+- `train/l1_global`
+- `train/gradient`
+- `train/dice`
+- `train/iou`
+- `train/active_mae`
+- `train/bg_mae`
 - `val/loss`
-- `val/bce`
-- `val/l1_all`
+- `val/loss_prob`
+- `val/focal`
+- `val/dice_loss`
 - `val/l1_active`
+- `val/l1_bg`
+- `val/l1_global`
+- `val/gradient`
+- `val/dice`
+- `val/iou`
+- `val/active_mae`
+- `val/bg_mae`
 - `lr`
 
 ## 10. 图像可视化
@@ -580,7 +634,8 @@ for path in frame_paths:
 x = torch.from_numpy(np.stack(frames, axis=0)).unsqueeze(0).to(device)
 
 with torch.no_grad():
-    prob, correction = model(x)
+    prob_logits, correction = model(x)
+    prob = torch.sigmoid(prob_logits)
     restored = restore_future_frame(x[:, -1:, :, :], prob, correction, threshold=0.5)
 
 out = restored[0, 0].cpu().numpy()
