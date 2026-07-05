@@ -13,6 +13,17 @@ from burn_recovery_net import BurnRecoveryNet
 from train_burn_recovery import BurnRecoveryDataset, TrainConfig, run_one_epoch, set_seed
 
 
+def apply_saved_config(cfg: TrainConfig, saved_cfg: dict):
+    for key, value in saved_cfg.items():
+        if not hasattr(cfg, key):
+            continue
+        if key.endswith("_root") or key in {"output_dir", "resume_checkpoint"}:
+            value = Path(value) if value is not None else None
+        elif key == "image_size" and value is not None:
+            value = tuple(value)
+        setattr(cfg, key, value)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate BurnRecoveryNet checkpoints.")
     parser.add_argument(
@@ -47,6 +58,10 @@ def main():
     cfg = TrainConfig()
     set_seed(cfg.seed)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    apply_saved_config(cfg, checkpoint.get("config", {}))
+
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
     if args.image_height is not None or args.image_width is not None:
@@ -54,16 +69,15 @@ def main():
             raise ValueError("Set both --image-height and --image-width.")
         cfg.image_size = (args.image_height, args.image_width)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-
     model = BurnRecoveryNet(in_frames=5, base_channels=cfg.base_channels).to(device)
     model.load_state_dict(checkpoint["model"])
 
     print(f"checkpoint: {args.checkpoint}")
     print(f"device: {device}")
+    print(f"base_channels: {cfg.base_channels}")
     print(f"image_size: {cfg.image_size}")
     print(f"batch_size: {cfg.batch_size}")
+    print(f"mask_threshold: {cfg.mask_threshold:.6f}")
 
     for root in args.roots:
         dataset = BurnRecoveryDataset(
@@ -74,6 +88,7 @@ def main():
             max_samples=args.max_samples,
             no_burn_probability=0.0,
             mask_threshold=cfg.mask_threshold,
+            saturation_percentile=cfg.saturation_percentile,
         )
         loader = DataLoader(
             dataset,
@@ -95,6 +110,10 @@ def main():
             "active_rmse",
             "bg_mae",
             "bg_changed",
+            "bg_changed_2",
+            "global_mae",
+            "max_error",
+            "bg_max",
         ]:
             print(f"{key}: {metrics[key]:.6f}")
 

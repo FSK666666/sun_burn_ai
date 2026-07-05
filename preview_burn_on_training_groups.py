@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import re
 import os
+import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -43,6 +44,11 @@ import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 import numpy as np
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+cv2.setNumThreads(1)
 
 
 def configure_matplotlib_chinese_font():
@@ -1194,4 +1200,5 @@ def main():
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     main()

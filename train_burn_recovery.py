@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 import random
 import time
@@ -60,6 +60,8 @@ class TrainConfig:
     weight_decay: float = 1e-4
     use_amp: bool = True
     grad_clip_norm: float = 1.0
+    use_scheduler: bool = True
+    resume_checkpoint: Path | None = None
 
     base_channels: int = 32
     p_loss_weight: float = 1.0
@@ -72,11 +74,14 @@ class TrainConfig:
     focal_gamma: float = 2.0
     mask_threshold: float = 8.0 / 255.0
     background_change_threshold: float = 1.0 / 255.0
+    saturation_percentile: float = 1.0
 
     temporal_scale_range: tuple[float, float] = (0.92, 1.08)
     train_no_burn_probability: float = 0.15
     val_no_burn_probability: float = 0.15
     generate_missing_burn: bool = True
+    val_generate_missing_burn: bool = False
+    validate_samples_on_init: bool = False
     max_train_samples: int | None = None
     max_val_samples: int | None = 500
     val_subset_seed: int = 20260705
@@ -137,6 +142,8 @@ class BurnRecoveryDataset(Dataset):
         no_burn_seed: int = 0,
         deterministic_no_burn: bool = False,
         mask_threshold: float = 8.0 / 255.0,
+        saturation_percentile: float = 1.0,
+        validate_samples: bool = False,
     ):
         self.root = Path(root)
         self.image_size = image_size
@@ -146,6 +153,7 @@ class BurnRecoveryDataset(Dataset):
         self.no_burn_seed = int(no_burn_seed)
         self.deterministic_no_burn = deterministic_no_burn
         self.mask_threshold = float(mask_threshold)
+        self.saturation_percentile = float(saturation_percentile)
 
         if not self.root.is_dir():
             raise FileNotFoundError(f"Dataset root not found: {self.root}")
@@ -165,6 +173,15 @@ class BurnRecoveryDataset(Dataset):
         if max_samples is not None:
             valid_dirs = valid_dirs[:max_samples]
 
+        if validate_samples:
+            valid_dirs, invalid = self._validate_sample_dirs(valid_dirs)
+            print(
+                f"{self.root}: valid samples={len(valid_dirs)}, "
+                f"invalid samples={len(invalid)}"
+            )
+            for folder, reason in invalid[:20]:
+                print(f"  invalid {folder}: {reason}")
+
         if not valid_dirs:
             raise RuntimeError(
                 f"No samples with synthetic_burn_trace.npy found under {self.root}. "
@@ -172,6 +189,56 @@ class BurnRecoveryDataset(Dataset):
             )
 
         self.sample_dirs = valid_dirs
+
+    def _list_frame_paths(self, sample_dir: Path) -> list[Path]:
+        expected_stems = {"000", "001", "002", "003", "004"}
+        frame_paths = sorted(
+            [
+                p for p in sample_dir.iterdir()
+                if p.is_file()
+                and p.stem in expected_stems
+                and p.suffix.lower() in IMAGE_SUFFIXES
+            ],
+            key=natural_key,
+        )
+
+        if len(frame_paths) != 5:
+            raise RuntimeError(
+                f"{sample_dir} should contain exactly 5 frame images, got {len(frame_paths)}"
+            )
+        return frame_paths
+
+    def _validate_sample_dirs(self, sample_dirs: list[Path]) -> tuple[list[Path], list[tuple[Path, str]]]:
+        valid = []
+        invalid = []
+
+        for sample_dir in sample_dirs:
+            try:
+                frame_paths = self._list_frame_paths(sample_dir)
+                shape = None
+                for path in frame_paths:
+                    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+                    if img is None:
+                        raise RuntimeError(f"failed to read {path.name}")
+                    if shape is None:
+                        shape = img.shape
+                    elif img.shape != shape:
+                        raise RuntimeError(f"shape mismatch at {path.name}")
+
+                burn_path = sample_dir / "synthetic_burn_trace.npy"
+                if not burn_path.is_file() and not self.generate_missing_burn:
+                    raise RuntimeError("missing synthetic_burn_trace.npy")
+                if burn_path.is_file():
+                    burn = np.load(burn_path, mmap_mode="r")
+                    if shape is not None and tuple(burn.shape) != tuple(shape):
+                        raise RuntimeError(
+                            f"burn shape {tuple(burn.shape)} does not match frame shape {shape}"
+                        )
+                valid.append(sample_dir)
+            except Exception as exc:
+                invalid.append((sample_dir, str(exc)))
+
+        return valid, invalid
 
     def __len__(self) -> int:
         return len(self.sample_dirs)
@@ -189,18 +256,7 @@ class BurnRecoveryDataset(Dataset):
         return bool(np.random.random() < self.no_burn_probability)
 
     def _load_frames(self, sample_dir: Path) -> np.ndarray:
-        frame_paths = sorted(
-            [
-                p for p in sample_dir.iterdir()
-                if p.is_file()
-                and p.suffix.lower() in IMAGE_SUFFIXES
-                and p.name.startswith(("000", "001", "002", "003", "004"))
-            ],
-            key=natural_key,
-        )[:5]
-
-        if len(frame_paths) != 5:
-            raise RuntimeError(f"{sample_dir} should contain 5 frame images, got {len(frame_paths)}")
+        frame_paths = self._list_frame_paths(sample_dir)
 
         frames = []
         for path in frame_paths:
@@ -243,15 +299,26 @@ class BurnRecoveryDataset(Dataset):
             raw_correction = np.zeros((h, w), dtype=np.float32)
         else:
             raw_correction = self._load_burn_trace(sample_dir, (h, w))
-        mask = (raw_correction >= self.mask_threshold).astype(np.float32)
 
         low, high = self.temporal_scale_range
         scales = np.random.uniform(low, high, size=(5, 1, 1)).astype(np.float32)
-        scaled_correction = raw_correction[None, :, :] * scales
-        effective_correction = np.minimum(scaled_correction, 1.0 - clean)
-        effective_correction = np.maximum(effective_correction, 0.0).astype(np.float32)
-        burned = np.clip(clean + effective_correction, 0.0, 1.0)
-        correction = np.median(effective_correction, axis=0).astype(np.float32)
+        max_burn = raw_correction[None, :, :] * scales
+        headroom = np.maximum(1.0 - clean, 0.0)
+        valid = max_burn > 1e-6
+
+        global_scale = 1.0
+        if np.any(valid):
+            ratio = headroom[valid] / max_burn[valid]
+            global_scale = min(
+                1.0,
+                float(np.percentile(ratio, self.saturation_percentile)),
+            )
+            global_scale = max(global_scale, 0.0)
+
+        scaled_correction = max_burn * global_scale
+        burned = np.clip(clean + scaled_correction, 0.0, 1.0)
+        correction = (raw_correction * global_scale).astype(np.float32)
+        mask = (correction >= self.mask_threshold).astype(np.float32)
 
         return {
             "x": torch.from_numpy(burned).float(),
@@ -355,7 +422,7 @@ def compute_loss(
 
 
 @torch.no_grad()
-def compute_metrics(
+def compute_metric_sums(
     prob: torch.Tensor,
     correction: torch.Tensor,
     p_target: torch.Tensor,
@@ -365,47 +432,92 @@ def compute_metrics(
     pred_mask = prob >= 0.5
     target_mask = p_target > 0.5
     background = ~target_mask
-    eps = 1e-6
 
     tp = (pred_mask & target_mask).sum().float()
     fp = (pred_mask & background).sum().float()
     fn = ((~pred_mask) & target_mask).sum().float()
-
-    precision_den = tp + fp
-    recall_den = tp + fn
-    overlap_den = tp + fp + fn
-    dice_den = 2.0 * tp + fp + fn
-    precision = torch.where(precision_den > 0, tp / (precision_den + eps), torch.ones_like(tp))
-    recall = torch.where(recall_den > 0, tp / (recall_den + eps), torch.ones_like(tp))
-    f1 = 2.0 * precision * recall / (precision + recall + eps)
-    iou = torch.where(overlap_den > 0, tp / (overlap_den + eps), torch.ones_like(tp))
-    dice = torch.where(dice_den > 0, 2.0 * tp / (dice_den + eps), torch.ones_like(tp))
-
     error = torch.abs(correction - c_target)
-    if target_mask.any():
-        active_mae = error[target_mask].mean()
-        active_rmse = torch.sqrt(torch.mean((correction[target_mask] - c_target[target_mask]).pow(2)))
-    else:
-        active_mae = correction.new_tensor(0.0)
-        active_rmse = correction.new_tensor(0.0)
 
-    if background.any():
-        bg_mae = torch.abs(correction[background]).mean()
-        bg_changed = (torch.abs(correction[background]) > cfg.background_change_threshold).float().mean()
+    active_count = target_mask.sum().float()
+    if active_count > 0:
+        active_abs = error[target_mask].sum()
+        active_sq = (correction[target_mask] - c_target[target_mask]).pow(2).sum()
     else:
-        bg_mae = correction.new_tensor(0.0)
-        bg_changed = correction.new_tensor(0.0)
+        active_abs = correction.new_tensor(0.0)
+        active_sq = correction.new_tensor(0.0)
+
+    bg_count = background.sum().float()
+    if bg_count > 0:
+        bg_pred_abs = torch.abs(correction[background])
+        bg_abs = bg_pred_abs.sum()
+        bg_changed_1 = (bg_pred_abs > cfg.background_change_threshold).float().sum()
+        bg_changed_2 = (bg_pred_abs > 2.0 * cfg.background_change_threshold).float().sum()
+        bg_max = bg_pred_abs.max()
+    else:
+        bg_abs = correction.new_tensor(0.0)
+        bg_changed_1 = correction.new_tensor(0.0)
+        bg_changed_2 = correction.new_tensor(0.0)
+        bg_max = correction.new_tensor(0.0)
+
+    global_abs = error.sum()
+    global_count = torch.tensor(error.numel(), device=error.device, dtype=error.dtype)
+    max_error = error.max()
 
     return {
-        "precision": float(precision.detach().cpu()),
-        "recall": float(recall.detach().cpu()),
-        "f1": float(f1.detach().cpu()),
-        "dice": float(dice.detach().cpu()),
-        "iou": float(iou.detach().cpu()),
-        "active_mae": float(active_mae.detach().cpu()),
-        "active_rmse": float(active_rmse.detach().cpu()),
-        "bg_mae": float(bg_mae.detach().cpu()),
-        "bg_changed": float(bg_changed.detach().cpu()),
+        "tp": float(tp.detach().cpu()),
+        "fp": float(fp.detach().cpu()),
+        "fn": float(fn.detach().cpu()),
+        "active_abs": float(active_abs.detach().cpu()),
+        "active_sq": float(active_sq.detach().cpu()),
+        "active_count": float(active_count.detach().cpu()),
+        "bg_abs": float(bg_abs.detach().cpu()),
+        "bg_count": float(bg_count.detach().cpu()),
+        "bg_changed_1": float(bg_changed_1.detach().cpu()),
+        "bg_changed_2": float(bg_changed_2.detach().cpu()),
+        "bg_max": float(bg_max.detach().cpu()),
+        "global_abs": float(global_abs.detach().cpu()),
+        "global_count": float(global_count.detach().cpu()),
+        "max_error": float(max_error.detach().cpu()),
+    }
+
+
+def finalize_metrics(sums: dict[str, float]) -> dict[str, float]:
+    eps = 1e-6
+    tp = sums.get("tp", 0.0)
+    fp = sums.get("fp", 0.0)
+    fn = sums.get("fn", 0.0)
+
+    precision = 1.0 if tp + fp <= 0 else tp / (tp + fp + eps)
+    recall = 1.0 if tp + fn <= 0 else tp / (tp + fn + eps)
+    f1 = 2.0 * precision * recall / (precision + recall + eps)
+    dice = 1.0 if 2 * tp + fp + fn <= 0 else 2 * tp / (2 * tp + fp + fn + eps)
+    iou = 1.0 if tp + fp + fn <= 0 else tp / (tp + fp + fn + eps)
+
+    active_count = sums.get("active_count", 0.0)
+    bg_count = sums.get("bg_count", 0.0)
+    global_count = sums.get("global_count", 0.0)
+
+    active_mae = 0.0 if active_count <= 0 else sums.get("active_abs", 0.0) / (active_count + eps)
+    active_rmse = 0.0 if active_count <= 0 else (sums.get("active_sq", 0.0) / (active_count + eps)) ** 0.5
+    bg_mae = 0.0 if bg_count <= 0 else sums.get("bg_abs", 0.0) / (bg_count + eps)
+    bg_changed = 0.0 if bg_count <= 0 else sums.get("bg_changed_1", 0.0) / (bg_count + eps)
+    bg_changed_2 = 0.0 if bg_count <= 0 else sums.get("bg_changed_2", 0.0) / (bg_count + eps)
+    global_mae = 0.0 if global_count <= 0 else sums.get("global_abs", 0.0) / (global_count + eps)
+
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "dice": dice,
+        "iou": iou,
+        "active_mae": active_mae,
+        "active_rmse": active_rmse,
+        "bg_mae": bg_mae,
+        "bg_changed": bg_changed,
+        "bg_changed_2": bg_changed_2,
+        "global_mae": global_mae,
+        "max_error": sums.get("max_error", 0.0),
+        "bg_max": sums.get("bg_max", 0.0),
     }
 
 
@@ -421,7 +533,7 @@ def run_one_epoch(
     model.train(is_train)
     total_loss = 0.0
     total_parts: dict[str, float] = {}
-    total_metrics: dict[str, float] = {}
+    total_metric_sums: dict[str, float] = {}
     n_batches = 0
 
     total_batches = len(loader)
@@ -445,7 +557,7 @@ def run_one_epoch(
         prob = torch.sigmoid(prob_logits)
         correction = correction.float()
         loss, parts = compute_loss(prob_logits, correction, p_target, c_target, cfg)
-        metrics = compute_metrics(prob, correction, p_target, c_target, cfg)
+        metric_sums = compute_metric_sums(prob, correction, p_target, c_target, cfg)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -465,8 +577,11 @@ def run_one_epoch(
         total_loss += float(loss.detach().cpu())
         for key, value in parts.items():
             total_parts[key] = total_parts.get(key, 0.0) + value
-        for key, value in metrics.items():
-            total_metrics[key] = total_metrics.get(key, 0.0) + value
+        for key, value in metric_sums.items():
+            if key in {"max_error", "bg_max"}:
+                total_metric_sums[key] = max(total_metric_sums.get(key, 0.0), value)
+            else:
+                total_metric_sums[key] = total_metric_sums.get(key, 0.0) + value
         n_batches += 1
 
         if (
@@ -483,7 +598,7 @@ def run_one_epoch(
     denom = max(n_batches, 1)
     result = {"loss": total_loss / denom}
     result.update({key: value / denom for key, value in total_parts.items()})
-    result.update({key: value / denom for key, value in total_metrics.items()})
+    result.update(finalize_metrics(total_metric_sums))
     return result
 
 
@@ -491,6 +606,8 @@ def save_checkpoint(
     path: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler | None,
+    scheduler,
     epoch: int,
     best_val: float,
     cfg: TrainConfig,
@@ -502,7 +619,9 @@ def save_checkpoint(
             "best_val": best_val,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "config": cfg.__dict__,
+            "scaler": scaler.state_dict() if scaler is not None else None,
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "config": asdict(cfg),
         },
         path,
     )
@@ -553,7 +672,12 @@ def save_visualizations(
 
         prob_logits, correction = model(x)
         prob = torch.sigmoid(prob_logits)
-        restored = torch.clamp(x[:, -1:, :, :] - (prob > 0.5).float() * correction, 0.0, 1.0)
+        restored_direct = torch.clamp(x[:, -1:, :, :] - correction, 0.0, 1.0)
+        restored_gated = torch.clamp(
+            x[:, -1:, :, :] - (prob > 0.5).float() * correction,
+            0.0,
+            1.0,
+        )
 
         batch_size = x.shape[0]
         for i in range(batch_size):
@@ -563,7 +687,8 @@ def save_visualizations(
             panels = [
                 add_label(to_u8_image(x[i, -1].cpu().numpy()), "input burned"),
                 add_label(to_u8_image(clean[i, -1].cpu().numpy()), "target clean"),
-                add_label(to_u8_image(restored[i, 0].cpu().numpy()), "restored"),
+                add_label(to_u8_image(restored_direct[i, 0].cpu().numpy()), "restored direct"),
+                add_label(to_u8_image(restored_gated[i, 0].cpu().numpy()), "restored gated"),
                 add_label(to_u8_image(prob[i, 0].cpu().numpy()), "pred P"),
                 add_label(to_u8_image(p_target[i, 0].cpu().numpy()), "target mask"),
                 add_label(to_u8_image(correction[i, 0].cpu().numpy()), "pred C"),
@@ -598,17 +723,21 @@ def main():
         no_burn_seed=cfg.seed,
         deterministic_no_burn=False,
         mask_threshold=cfg.mask_threshold,
+        saturation_percentile=cfg.saturation_percentile,
+        validate_samples=cfg.validate_samples_on_init,
     )
     val_dataset = BurnRecoveryDataset(
         root=cfg.val_root,
         image_size=cfg.image_size,
         temporal_scale_range=(1.0, 1.0),
-        generate_missing_burn=cfg.generate_missing_burn,
+        generate_missing_burn=cfg.val_generate_missing_burn,
         max_samples=None,
         no_burn_probability=cfg.val_no_burn_probability,
         no_burn_seed=cfg.val_subset_seed,
         deterministic_no_burn=True,
         mask_threshold=cfg.mask_threshold,
+        saturation_percentile=cfg.saturation_percentile,
+        validate_samples=cfg.validate_samples_on_init,
     )
     full_val_samples = len(val_dataset)
     val_dataset = make_fixed_random_subset(
@@ -642,6 +771,25 @@ def main():
         "cuda",
         enabled=bool(cfg.use_amp and device.type == "cuda"),
     )
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+        if cfg.use_scheduler
+        else None
+    )
+    start_epoch = 1
+    best_val = float("inf")
+
+    if cfg.resume_checkpoint is not None:
+        checkpoint = torch.load(cfg.resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        if checkpoint.get("scaler") is not None:
+            scaler.load_state_dict(checkpoint["scaler"])
+        if scheduler is not None and checkpoint.get("scheduler") is not None:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        best_val = float(checkpoint.get("best_val", best_val))
+        print(f"resumed checkpoint: {cfg.resume_checkpoint}")
 
     print(f"train samples: {len(train_dataset)}")
     print(f"val samples: {len(val_dataset)} / {full_val_samples}")
@@ -652,7 +800,9 @@ def main():
     print(f"train no-burn probability: {cfg.train_no_burn_probability}")
     print(f"val no-burn probability: {cfg.val_no_burn_probability}")
     print(f"mask threshold: {cfg.mask_threshold:.6f}")
+    print(f"saturation percentile: {cfg.saturation_percentile}")
     print(f"grad clip norm: {cfg.grad_clip_norm}")
+    print(f"scheduler: {scheduler.__class__.__name__ if scheduler is not None else 'None'}")
 
     writer = None
     if cfg.use_tensorboard:
@@ -662,8 +812,7 @@ def main():
             writer = SummaryWriter(log_dir=str(cfg.output_dir / "runs"))
             print(f"tensorboard log dir: {cfg.output_dir / 'runs'}")
 
-    best_val = float("inf")
-    for epoch in range(1, cfg.epochs + 1):
+    for epoch in range(start_epoch, cfg.epochs + 1):
         start = time.time()
         train_metrics = run_one_epoch(model, train_loader, optimizer, device, cfg, scaler)
         val_metrics = run_one_epoch(model, val_loader, None, device, cfg)
@@ -688,6 +837,10 @@ def main():
             writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
             writer.flush()
 
+        is_best = val_metrics["loss"] < best_val
+        if is_best:
+            best_val = val_metrics["loss"]
+
         if cfg.vis_every_epoch:
             save_visualizations(model, val_loader, device, cfg, epoch)
 
@@ -696,22 +849,28 @@ def main():
                 cfg.output_dir / f"epoch_{epoch:03d}.pt",
                 model,
                 optimizer,
+                scaler,
+                scheduler,
                 epoch,
                 best_val,
                 cfg,
             )
 
-        if val_metrics["loss"] < best_val:
-            best_val = val_metrics["loss"]
+        if is_best:
             save_checkpoint(
                 cfg.output_dir / "best.pt",
                 model,
                 optimizer,
+                scaler,
+                scheduler,
                 epoch,
                 best_val,
                 cfg,
             )
             print(f"  saved best.pt, best_val={best_val:.5f}")
+
+        if scheduler is not None:
+            scheduler.step()
 
     if writer is not None:
         writer.close()

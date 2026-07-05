@@ -322,11 +322,14 @@ focal_alpha = 0.25
 focal_gamma = 2.0
 mask_threshold = 8.0 / 255.0
 background_change_threshold = 1.0 / 255.0
+saturation_percentile = 1.0
 
 temporal_scale_range = (0.92, 1.08)
 train_no_burn_probability = 0.15
 val_no_burn_probability = 0.15
 generate_missing_burn = True
+val_generate_missing_burn = False
+validate_samples_on_init = False
 max_train_samples = None
 max_val_samples = 500
 val_subset_seed = 20260705
@@ -335,6 +338,8 @@ use_tensorboard = True
 vis_every_epoch = True
 vis_num_samples = 4
 progress_print_every = 50
+use_scheduler = True
+grad_clip_norm = 1.0
 ```
 
 注意：8GB 显存下，`image_size=None` 且 `batch_size=6` 可能 OOM。更稳的推荐配置是：
@@ -370,14 +375,21 @@ correction = synthetic_burn_trace / 255.0
 mask = correction >= (8.0 / 255.0)
 ```
 
-输入网络前，会把灼烧加到干净图上。为了避免 8 bit 图像饱和导致“标签要求网络预测不可见亮度”的问题，当前训练标签使用实际可见的有效偏置：
+输入网络前，会把灼烧加到干净图上。为了避免 8 bit 图像饱和，同时保持标签代表同一个固定探测器灼烧状态，当前使用统一缩放，而不是逐像素裁剪标签：
 
 ```python
-scaled = correction[None, :, :] * temporal_scale
-effective = np.minimum(scaled, 1.0 - clean)
-burned = clean + effective
-c_target = np.median(effective, axis=0)
+max_burn = correction[None, :, :] * temporal_scale
+headroom = 1.0 - clean
+ratio = headroom[max_burn > 1e-6] / max_burn[max_burn > 1e-6]
+global_scale = min(1.0, percentile(ratio, 1.0))
+
+scaled = max_burn * global_scale
+burned = clip(clean + scaled, 0, 1)
+c_target = correction * global_scale
+mask = c_target >= (8.0 / 255.0)
 ```
+
+这样 `P_target` 和 `C_target` 描述的是同一个最终灼烧状态，避免出现 `mask=1` 但 `correction≈0` 的矛盾监督。
 
 其中训练集 temporal scale 在 `(0.92, 1.08)` 随机变化，验证集固定为 `(1.0, 1.0)`。
 
@@ -443,11 +455,31 @@ val_subset_seed = 20260705
 
 测试集 `test` 和 `test_flir` 不在训练循环中每 epoch 运行。建议训练完成后用 `best.pt` 单独完整测试。
 
+验证集默认要求使用预生成标签：
+
+```python
+val_generate_missing_burn = False
+```
+
+这样不同 epoch 的验证集标签固定，`val_loss` 和 `best.pt` 选择可复现。
+
 训练完成后可运行独立评估脚本：
 
 ```powershell
 python test_burn_recovery.py --checkpoint C:\Users\17874\Documents\python\checkpoints\burn_recovery\best.pt
 ```
+
+测试脚本会优先读取 checkpoint 中保存的 `config`，恢复：
+
+```text
+base_channels
+image_size
+mask_threshold
+saturation_percentile
+batch_size
+```
+
+如果命令行显式传入 `--batch-size` 或 `--image-height/--image-width`，则以命令行为准。
 
 默认会依次评估：
 
@@ -462,6 +494,8 @@ datasets\burn_recovery\test_flir
 ```powershell
 python test_burn_recovery.py --generate-missing-burn
 ```
+
+指标采用全数据集累计 TP/FP/FN 和误差总量后统一计算，不再简单平均每个 batch 的 Dice/IoU。
 
 ### 8.4 训练进度
 
@@ -572,7 +606,8 @@ C:\Users\17874\Documents\python\checkpoints\burn_recovery\vis\epoch_001
 ```text
 input burned
 target clean
-restored
+restored direct
+restored gated
 pred P
 target mask
 pred C
@@ -583,7 +618,8 @@ target C
 
 - `input burned`：加入合成灼烧后的输入帧。
 - `target clean`：原始干净帧。
-- `restored`：网络恢复结果。
+- `restored direct`：直接使用 `future - C` 的恢复结果，用于检查偏置头。
+- `restored gated`：使用 `future - (P > 0.5) * C` 的恢复结果，用于检查概率门控。
 - `pred P`：网络预测的灼烧概率。
 - `target mask`：真实灼烧区域。
 - `pred C`：网络预测的灼烧强度。
