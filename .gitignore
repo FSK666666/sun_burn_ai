@@ -1,0 +1,53 @@
+# Python cache/build files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE/user files
+.vscode/
+.idea/
+
+# Datasets and generated data
+datasets/
+data/
+cifar-10-batches-py/
+SoonminHwang-rgbt-ped-detection-f238a61/
+synthetic_burn_preview/
+
+# Training outputs
+checkpoints/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# Large/raw media and downloaded artifacts
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.tar
+*.zip
+*.7z
+*.rar
+*.npy
+*.npz
+
+# Logs/temp files
+*.log
+*.tmp
+*.bak
+Thumbs.db
+.DS_Store

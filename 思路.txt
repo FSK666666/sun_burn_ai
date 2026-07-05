@@ -1,0 +1,23 @@
+输入：
+    历史5帧 [B,5,H,W]
+
+网络：
+    1×1时序融合
+    + 两级轻量多尺度编码器
+    + 深度可分离卷积
+    + 轻量解码器
+    + 双输出头
+
+输出：
+    P：灼烧概率图
+    C：有效偏置纠正图
+
+训练标签：
+    合成Mask
+    合成偏置图
+
+未来帧到达后：
+    future_restored = future_frame - C
+
+可选安全门控：
+    future_restored = future_frame - (P > threshold) * C
