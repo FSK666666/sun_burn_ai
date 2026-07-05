@@ -119,6 +119,7 @@ class BurnRecoveryNet(nn.Module):
 
     def __init__(self, in_frames: int = 5, base_channels: int = 32):
         super().__init__()
+        self.in_frames = int(in_frames)
         c1 = base_channels
         c2 = base_channels * 2
         c3 = base_channels * 4
@@ -152,7 +153,9 @@ class BurnRecoveryNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if x.ndim != 4:
-            raise ValueError(f"Expected input shape [B, 5, H, W], got {tuple(x.shape)}")
+            raise ValueError(f"Expected input shape [B, C, H, W], got {tuple(x.shape)}")
+        if x.shape[1] != self.in_frames:
+            raise ValueError(f"Expected {self.in_frames} input frames, got {x.shape[1]}")
 
         s1 = self.temporal_fuse(x)
         s2 = self.enc1(s1)

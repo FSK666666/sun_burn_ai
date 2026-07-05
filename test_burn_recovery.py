@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument("--image-height", type=int, default=None)
     parser.add_argument("--image-width", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--no-burn-probability", type=float, default=0.0)
     parser.add_argument(
         "--generate-missing-burn",
         action="store_true",
@@ -78,6 +79,7 @@ def main():
     print(f"image_size: {cfg.image_size}")
     print(f"batch_size: {cfg.batch_size}")
     print(f"mask_threshold: {cfg.mask_threshold:.6f}")
+    print(f"no_burn_probability: {args.no_burn_probability}")
 
     for root in args.roots:
         dataset = BurnRecoveryDataset(
@@ -86,9 +88,11 @@ def main():
             temporal_scale_range=(1.0, 1.0),
             generate_missing_burn=args.generate_missing_burn,
             max_samples=args.max_samples,
-            no_burn_probability=0.0,
+            no_burn_probability=args.no_burn_probability,
+            no_burn_seed=cfg.seed,
+            deterministic_no_burn=True,
             mask_threshold=cfg.mask_threshold,
-            saturation_percentile=cfg.saturation_percentile,
+            aggregation=cfg.aggregation,
         )
         loader = DataLoader(
             dataset,
@@ -106,12 +110,14 @@ def main():
             "iou",
             "precision",
             "recall",
+            "false_positive_rate",
             "active_mae",
             "active_rmse",
             "bg_mae",
             "bg_changed",
             "bg_changed_2",
             "global_mae",
+            "p95_error",
             "max_error",
             "bg_max",
         ]:

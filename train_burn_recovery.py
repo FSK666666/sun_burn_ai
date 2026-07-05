@@ -59,7 +59,7 @@ class TrainConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     use_amp: bool = True
-    grad_clip_norm: float = 1.0
+    grad_clip_norm: float = 5.0
     use_scheduler: bool = True
     resume_checkpoint: Path | None = None
 
@@ -70,11 +70,11 @@ class TrainConfig:
     c_global_loss_weight: float = 0.20
     gradient_loss_weight: float = 0.10
     dice_loss_weight: float = 0.50
-    focal_alpha: float = 0.25
+    focal_alpha: float = 0.50
     focal_gamma: float = 2.0
-    mask_threshold: float = 8.0 / 255.0
+    mask_threshold: float = 2.0 / 255.0
     background_change_threshold: float = 1.0 / 255.0
-    saturation_percentile: float = 1.0
+    aggregation: str = "median"
 
     temporal_scale_range: tuple[float, float] = (0.92, 1.08)
     train_no_burn_probability: float = 0.15
@@ -130,6 +130,21 @@ def make_fixed_random_subset(dataset: Dataset, max_samples: int | None, seed: in
     return Subset(dataset, indices)
 
 
+def apply_saved_config_for_resume(cfg: TrainConfig, saved_cfg: dict):
+    runtime_keys = {
+        "train_root",
+        "val_root",
+        "output_dir",
+        "resume_checkpoint",
+    }
+    for key, value in saved_cfg.items():
+        if key in runtime_keys or not hasattr(cfg, key):
+            continue
+        if key == "image_size" and value is not None:
+            value = tuple(value)
+        setattr(cfg, key, value)
+
+
 class BurnRecoveryDataset(Dataset):
     def __init__(
         self,
@@ -142,7 +157,7 @@ class BurnRecoveryDataset(Dataset):
         no_burn_seed: int = 0,
         deterministic_no_burn: bool = False,
         mask_threshold: float = 8.0 / 255.0,
-        saturation_percentile: float = 1.0,
+        aggregation: str = "median",
         validate_samples: bool = False,
     ):
         self.root = Path(root)
@@ -153,7 +168,7 @@ class BurnRecoveryDataset(Dataset):
         self.no_burn_seed = int(no_burn_seed)
         self.deterministic_no_burn = deterministic_no_burn
         self.mask_threshold = float(mask_threshold)
-        self.saturation_percentile = float(saturation_percentile)
+        self.aggregation = str(aggregation)
 
         if not self.root.is_dir():
             raise FileNotFoundError(f"Dataset root not found: {self.root}")
@@ -274,6 +289,12 @@ class BurnRecoveryDataset(Dataset):
         burn_path = sample_dir / "synthetic_burn_trace.npy"
         if burn_path.is_file():
             burn = np.load(burn_path).astype(np.float32)
+            if not np.isfinite(burn).all():
+                raise ValueError(f"Non-finite burn label: {burn_path}")
+            if float(burn.min()) < 0:
+                raise ValueError(f"Negative burn label: {burn_path}")
+            if float(burn.max()) > 255.0 + 1e-3:
+                raise ValueError(f"Burn label exceeds 255: {burn_path}")
         elif self.generate_missing_burn:
             # 兜底：训练时临时生成一个标签，不写入磁盘。
             from preview_burn_on_training_groups import generate_burn_pattern, BURN_ACTIVE_THRESHOLD
@@ -290,6 +311,17 @@ class BurnRecoveryDataset(Dataset):
             burn = cv2.resize(burn, (w, h), interpolation=cv2.INTER_LINEAR)
         return np.maximum(burn, 0.0) / 255.0
 
+    def _aggregate_effective_correction(self, effective_correction: np.ndarray) -> np.ndarray:
+        if self.aggregation == "median":
+            return np.median(effective_correction, axis=0).astype(np.float32)
+        if self.aggregation == "mean":
+            return np.mean(effective_correction, axis=0).astype(np.float32)
+        if self.aggregation == "max":
+            return np.max(effective_correction, axis=0).astype(np.float32)
+        if self.aggregation == "last":
+            return effective_correction[-1].astype(np.float32)
+        raise ValueError(f"Unknown aggregation mode: {self.aggregation}")
+
     def __getitem__(self, index: int):
         sample_dir = self.sample_dirs[index]
         clean = self._load_frames(sample_dir)
@@ -302,23 +334,13 @@ class BurnRecoveryDataset(Dataset):
 
         low, high = self.temporal_scale_range
         scales = np.random.uniform(low, high, size=(5, 1, 1)).astype(np.float32)
-        max_burn = raw_correction[None, :, :] * scales
-        headroom = np.maximum(1.0 - clean, 0.0)
-        valid = max_burn > 1e-6
-
-        global_scale = 1.0
-        if np.any(valid):
-            ratio = headroom[valid] / max_burn[valid]
-            global_scale = min(
-                1.0,
-                float(np.percentile(ratio, self.saturation_percentile)),
-            )
-            global_scale = max(global_scale, 0.0)
-
-        scaled_correction = max_burn * global_scale
-        burned = np.clip(clean + scaled_correction, 0.0, 1.0)
-        correction = (raw_correction * global_scale).astype(np.float32)
-        mask = (correction >= self.mask_threshold).astype(np.float32)
+        requested_correction = raw_correction[None, :, :] * scales
+        effective_correction = np.minimum(requested_correction, 1.0 - clean)
+        effective_correction = np.maximum(effective_correction, 0.0).astype(np.float32)
+        burned = (clean + effective_correction).astype(np.float32)
+        correction = self._aggregate_effective_correction(effective_correction)
+        correction = np.where(correction >= self.mask_threshold, correction, 0.0).astype(np.float32)
+        mask = (correction > 0.0).astype(np.float32)
 
         return {
             "x": torch.from_numpy(burned).float(),
@@ -353,9 +375,12 @@ def dice_loss(
 ) -> torch.Tensor:
     dims = (1, 2, 3)
     intersection = (prob * target).sum(dim=dims)
-    union = prob.sum(dim=dims) + target.sum(dim=dims)
-    dice = (2.0 * intersection + eps) / (union + eps)
-    return 1.0 - dice.mean()
+    pred_sum = prob.sum(dim=dims)
+    target_sum = target.sum(dim=dims)
+    normal_loss = 1.0 - (2.0 * intersection + eps) / (pred_sum + target_sum + eps)
+    empty_target_loss = prob.mean(dim=dims)
+    loss = torch.where(target_sum > 0, normal_loss, empty_target_loss)
+    return loss.mean()
 
 
 def gradient_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -436,6 +461,7 @@ def compute_metric_sums(
     tp = (pred_mask & target_mask).sum().float()
     fp = (pred_mask & background).sum().float()
     fn = ((~pred_mask) & target_mask).sum().float()
+    tn = ((~pred_mask) & background).sum().float()
     error = torch.abs(correction - c_target)
 
     active_count = target_mask.sum().float()
@@ -462,11 +488,13 @@ def compute_metric_sums(
     global_abs = error.sum()
     global_count = torch.tensor(error.numel(), device=error.device, dtype=error.dtype)
     max_error = error.max()
+    error_hist = torch.histc(error.detach().float(), bins=256, min=0.0, max=1.0)
 
-    return {
+    result = {
         "tp": float(tp.detach().cpu()),
         "fp": float(fp.detach().cpu()),
         "fn": float(fn.detach().cpu()),
+        "tn": float(tn.detach().cpu()),
         "active_abs": float(active_abs.detach().cpu()),
         "active_sq": float(active_sq.detach().cpu()),
         "active_count": float(active_count.detach().cpu()),
@@ -479,6 +507,9 @@ def compute_metric_sums(
         "global_count": float(global_count.detach().cpu()),
         "max_error": float(max_error.detach().cpu()),
     }
+    for idx, value in enumerate(error_hist.cpu().tolist()):
+        result[f"error_hist_{idx}"] = float(value)
+    return result
 
 
 def finalize_metrics(sums: dict[str, float]) -> dict[str, float]:
@@ -486,12 +517,14 @@ def finalize_metrics(sums: dict[str, float]) -> dict[str, float]:
     tp = sums.get("tp", 0.0)
     fp = sums.get("fp", 0.0)
     fn = sums.get("fn", 0.0)
+    tn = sums.get("tn", 0.0)
 
     precision = 1.0 if tp + fp <= 0 else tp / (tp + fp + eps)
     recall = 1.0 if tp + fn <= 0 else tp / (tp + fn + eps)
     f1 = 2.0 * precision * recall / (precision + recall + eps)
     dice = 1.0 if 2 * tp + fp + fn <= 0 else 2 * tp / (2 * tp + fp + fn + eps)
     iou = 1.0 if tp + fp + fn <= 0 else tp / (tp + fp + fn + eps)
+    false_positive_rate = 0.0 if fp + tn <= 0 else fp / (fp + tn + eps)
 
     active_count = sums.get("active_count", 0.0)
     bg_count = sums.get("bg_count", 0.0)
@@ -503,6 +536,17 @@ def finalize_metrics(sums: dict[str, float]) -> dict[str, float]:
     bg_changed = 0.0 if bg_count <= 0 else sums.get("bg_changed_1", 0.0) / (bg_count + eps)
     bg_changed_2 = 0.0 if bg_count <= 0 else sums.get("bg_changed_2", 0.0) / (bg_count + eps)
     global_mae = 0.0 if global_count <= 0 else sums.get("global_abs", 0.0) / (global_count + eps)
+    hist = [sums.get(f"error_hist_{idx}", 0.0) for idx in range(256)]
+    hist_total = sum(hist)
+    p95_error = 0.0
+    if hist_total > 0:
+        cutoff = 0.95 * hist_total
+        cumulative = 0.0
+        for idx, count in enumerate(hist):
+            cumulative += count
+            if cumulative >= cutoff:
+                p95_error = (idx + 0.5) / 256.0
+                break
 
     return {
         "precision": precision,
@@ -510,12 +554,14 @@ def finalize_metrics(sums: dict[str, float]) -> dict[str, float]:
         "f1": f1,
         "dice": dice,
         "iou": iou,
+        "false_positive_rate": false_positive_rate,
         "active_mae": active_mae,
         "active_rmse": active_rmse,
         "bg_mae": bg_mae,
         "bg_changed": bg_changed,
         "bg_changed_2": bg_changed_2,
         "global_mae": global_mae,
+        "p95_error": p95_error,
         "max_error": sums.get("max_error", 0.0),
         "bg_max": sums.get("bg_max", 0.0),
     }
@@ -678,6 +724,7 @@ def save_visualizations(
             0.0,
             1.0,
         )
+        abs_error = torch.abs(correction - c_target)
 
         batch_size = x.shape[0]
         for i in range(batch_size):
@@ -685,7 +732,8 @@ def save_visualizations(
                 return
 
             panels = [
-                add_label(to_u8_image(x[i, -1].cpu().numpy()), "input burned"),
+                add_label(to_u8_image(x[i, 0].cpu().numpy()), "input first"),
+                add_label(to_u8_image(x[i, -1].cpu().numpy()), "input last"),
                 add_label(to_u8_image(clean[i, -1].cpu().numpy()), "target clean"),
                 add_label(to_u8_image(restored_direct[i, 0].cpu().numpy()), "restored direct"),
                 add_label(to_u8_image(restored_gated[i, 0].cpu().numpy()), "restored gated"),
@@ -693,6 +741,7 @@ def save_visualizations(
                 add_label(to_u8_image(p_target[i, 0].cpu().numpy()), "target mask"),
                 add_label(to_u8_image(correction[i, 0].cpu().numpy()), "pred C"),
                 add_label(to_u8_image(c_target[i, 0].cpu().numpy()), "target C"),
+                add_label(to_u8_image(abs_error[i, 0].cpu().numpy()), "abs error"),
             ]
 
             h = panels[0].shape[0]
@@ -708,6 +757,11 @@ def save_visualizations(
 
 def main():
     cfg = TrainConfig()
+    resume_data = None
+    if cfg.resume_checkpoint is not None:
+        resume_data = torch.load(cfg.resume_checkpoint, map_location="cpu")
+        apply_saved_config_for_resume(cfg, resume_data.get("config", {}))
+
     set_seed(cfg.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -723,7 +777,7 @@ def main():
         no_burn_seed=cfg.seed,
         deterministic_no_burn=False,
         mask_threshold=cfg.mask_threshold,
-        saturation_percentile=cfg.saturation_percentile,
+        aggregation=cfg.aggregation,
         validate_samples=cfg.validate_samples_on_init,
     )
     val_dataset = BurnRecoveryDataset(
@@ -736,7 +790,7 @@ def main():
         no_burn_seed=cfg.val_subset_seed,
         deterministic_no_burn=True,
         mask_threshold=cfg.mask_threshold,
-        saturation_percentile=cfg.saturation_percentile,
+        aggregation=cfg.aggregation,
         validate_samples=cfg.validate_samples_on_init,
     )
     full_val_samples = len(val_dataset)
@@ -779,16 +833,15 @@ def main():
     start_epoch = 1
     best_val = float("inf")
 
-    if cfg.resume_checkpoint is not None:
-        checkpoint = torch.load(cfg.resume_checkpoint, map_location=device)
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        if checkpoint.get("scaler") is not None:
-            scaler.load_state_dict(checkpoint["scaler"])
-        if scheduler is not None and checkpoint.get("scheduler") is not None:
-            scheduler.load_state_dict(checkpoint["scheduler"])
-        start_epoch = int(checkpoint.get("epoch", 0)) + 1
-        best_val = float(checkpoint.get("best_val", best_val))
+    if resume_data is not None:
+        model.load_state_dict(resume_data["model"])
+        optimizer.load_state_dict(resume_data["optimizer"])
+        if resume_data.get("scaler") is not None:
+            scaler.load_state_dict(resume_data["scaler"])
+        if scheduler is not None and resume_data.get("scheduler") is not None:
+            scheduler.load_state_dict(resume_data["scheduler"])
+        start_epoch = int(resume_data.get("epoch", 0)) + 1
+        best_val = float(resume_data.get("best_val", best_val))
         print(f"resumed checkpoint: {cfg.resume_checkpoint}")
 
     print(f"train samples: {len(train_dataset)}")
@@ -800,7 +853,7 @@ def main():
     print(f"train no-burn probability: {cfg.train_no_burn_probability}")
     print(f"val no-burn probability: {cfg.val_no_burn_probability}")
     print(f"mask threshold: {cfg.mask_threshold:.6f}")
-    print(f"saturation percentile: {cfg.saturation_percentile}")
+    print(f"aggregation: {cfg.aggregation}")
     print(f"grad clip norm: {cfg.grad_clip_norm}")
     print(f"scheduler: {scheduler.__class__.__name__ if scheduler is not None else 'None'}")
 
@@ -837,6 +890,9 @@ def main():
             writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
             writer.flush()
 
+        if scheduler is not None:
+            scheduler.step()
+
         is_best = val_metrics["loss"] < best_val
         if is_best:
             best_val = val_metrics["loss"]
@@ -868,9 +924,6 @@ def main():
                 cfg,
             )
             print(f"  saved best.pt, best_val={best_val:.5f}")
-
-        if scheduler is not None:
-            scheduler.step()
 
     if writer is not None:
         writer.close()

@@ -318,11 +318,11 @@ c_bg_loss_weight = 0.10
 c_global_loss_weight = 0.20
 gradient_loss_weight = 0.10
 dice_loss_weight = 0.50
-focal_alpha = 0.25
+focal_alpha = 0.50
 focal_gamma = 2.0
-mask_threshold = 8.0 / 255.0
+mask_threshold = 2.0 / 255.0
 background_change_threshold = 1.0 / 255.0
-saturation_percentile = 1.0
+aggregation = "median"
 
 temporal_scale_range = (0.92, 1.08)
 train_no_burn_probability = 0.15
@@ -339,7 +339,7 @@ vis_every_epoch = True
 vis_num_samples = 4
 progress_print_every = 50
 use_scheduler = True
-grad_clip_norm = 1.0
+grad_clip_norm = 5.0
 ```
 
 注意：8GB 显存下，`image_size=None` 且 `batch_size=6` 可能 OOM。更稳的推荐配置是：
@@ -375,21 +375,19 @@ correction = synthetic_burn_trace / 255.0
 mask = correction >= (8.0 / 255.0)
 ```
 
-输入网络前，会把灼烧加到干净图上。为了避免 8 bit 图像饱和，同时保持标签代表同一个固定探测器灼烧状态，当前使用统一缩放，而不是逐像素裁剪标签：
+输入网络前，会把灼烧加到干净图上。当前训练目标定义为图像中实际发生的有效灼烧偏置，而不是理论原始偏置：
 
 ```python
-max_burn = correction[None, :, :] * temporal_scale
-headroom = 1.0 - clean
-ratio = headroom[max_burn > 1e-6] / max_burn[max_burn > 1e-6]
-global_scale = min(1.0, percentile(ratio, 1.0))
+requested = correction[None, :, :] * temporal_scale
+effective = np.minimum(requested, 1.0 - clean)
+burned = clean + effective
 
-scaled = max_burn * global_scale
-burned = clip(clean + scaled, 0, 1)
-c_target = correction * global_scale
-mask = c_target >= (8.0 / 255.0)
+c_target = np.median(effective, axis=0)
+c_target = np.where(c_target >= mask_threshold, c_target, 0.0)
+mask = c_target > 0.0
 ```
 
-这样 `P_target` 和 `C_target` 描述的是同一个最终灼烧状态，避免出现 `mask=1` 但 `correction≈0` 的矛盾监督。
+这样可以保证合成数据中 `burned - c_target` 尽可能恢复原图，同时 `P_target` 和 `C_target` 描述同一个最终有效灼烧状态，避免出现 `mask=1` 但 `correction≈0` 的矛盾监督。
 
 其中训练集 temporal scale 在 `(0.92, 1.08)` 随机变化，验证集固定为 `(1.0, 1.0)`。
 
@@ -475,7 +473,7 @@ python test_burn_recovery.py --checkpoint C:\Users\17874\Documents\python\checkp
 base_channels
 image_size
 mask_threshold
-saturation_percentile
+aggregation
 batch_size
 ```
 
@@ -496,6 +494,29 @@ python test_burn_recovery.py --generate-missing-burn
 ```
 
 指标采用全数据集累计 TP/FP/FN 和误差总量后统一计算，不再简单平均每个 batch 的 Dice/IoU。
+
+可分别评估三种测试条件：
+
+```powershell
+# 全部有灼烧
+python test_burn_recovery.py --no-burn-probability 0.0
+
+# 全部无灼烧，用于检查误报和背景误修正
+python test_burn_recovery.py --no-burn-probability 1.0
+
+# 混合测试
+python test_burn_recovery.py --no-burn-probability 0.3
+```
+
+测试指标还包含：
+
+```text
+false_positive_rate
+global_mae
+p95_error
+bg_max
+bg_changed_2
+```
 
 ### 8.4 训练进度
 
@@ -604,7 +625,8 @@ C:\Users\17874\Documents\python\checkpoints\burn_recovery\vis\epoch_001
 每张可视化图包含：
 
 ```text
-input burned
+input first
+input last
 target clean
 restored direct
 restored gated
@@ -612,11 +634,13 @@ pred P
 target mask
 pred C
 target C
+abs error
 ```
 
 含义：
 
-- `input burned`：加入合成灼烧后的输入帧。
+- `input first`：加入合成灼烧后的第 1 帧。
+- `input last`：加入合成灼烧后的第 5 帧。
 - `target clean`：原始干净帧。
 - `restored direct`：直接使用 `future - C` 的恢复结果，用于检查偏置头。
 - `restored gated`：使用 `future - (P > 0.5) * C` 的恢复结果，用于检查概率门控。
@@ -624,6 +648,7 @@ target C
 - `target mask`：真实灼烧区域。
 - `pred C`：网络预测的灼烧强度。
 - `target C`：真实灼烧强度。
+- `abs error`：预测偏置和目标偏置的绝对误差。
 
 ## 11. 推理方法
 
