@@ -317,6 +317,8 @@ c_loss_weight = 1.0
 c_active_loss_weight = 4.0
 
 temporal_scale_range = (0.92, 1.08)
+train_no_burn_probability = 0.15
+val_no_burn_probability = 0.15
 generate_missing_burn = True
 max_train_samples = None
 max_val_samples = 500
@@ -368,6 +370,23 @@ burned = clean + correction * temporal_scale
 ```
 
 其中训练集 temporal scale 在 `(0.92, 1.08)` 随机变化，验证集固定为 `(1.0, 1.0)`。
+
+为了让网络学会“没有灼烧时不要修复”，训练和验证中还会加入一定比例的无灼烧负样本：
+
+```python
+train_no_burn_probability = 0.15
+val_no_burn_probability = 0.15
+```
+
+当某个样本被选为无灼烧样本时：
+
+```python
+correction = 0
+mask = 0
+burned = clean
+```
+
+训练集的无灼烧样本是随机出现的，用于增强鲁棒性；验证集的无灼烧样本由固定 seed 决定，保证每个 epoch 的验证结果可比较。
 
 ### 8.2 损失函数
 
@@ -755,4 +774,3 @@ progress_print_every = 0
    - 从前一阶段最优模型继续训练若干 epoch。
 
 当前脚本尚未实现“从 checkpoint 继续训练”的命令行接口。如需断点续训，需要在 `main()` 中加载 `best.pt` 或指定 checkpoint 后再进入训练循环。
-

@@ -66,6 +66,8 @@ class TrainConfig:
     c_active_loss_weight: float = 4.0
 
     temporal_scale_range: tuple[float, float] = (0.92, 1.08)
+    train_no_burn_probability: float = 0.15
+    val_no_burn_probability: float = 0.15
     generate_missing_burn: bool = True
     max_train_samples: int | None = None
     max_val_samples: int | None = 500
@@ -123,11 +125,17 @@ class BurnRecoveryDataset(Dataset):
         temporal_scale_range: tuple[float, float] = (1.0, 1.0),
         generate_missing_burn: bool = True,
         max_samples: int | None = None,
+        no_burn_probability: float = 0.0,
+        no_burn_seed: int = 0,
+        deterministic_no_burn: bool = False,
     ):
         self.root = Path(root)
         self.image_size = image_size
         self.temporal_scale_range = temporal_scale_range
         self.generate_missing_burn = generate_missing_burn
+        self.no_burn_probability = float(no_burn_probability)
+        self.no_burn_seed = int(no_burn_seed)
+        self.deterministic_no_burn = deterministic_no_burn
 
         if not self.root.is_dir():
             raise FileNotFoundError(f"Dataset root not found: {self.root}")
@@ -157,6 +165,18 @@ class BurnRecoveryDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.sample_dirs)
+
+    def _use_no_burn_sample(self, index: int) -> bool:
+        if self.no_burn_probability <= 0:
+            return False
+        if self.no_burn_probability >= 1:
+            return True
+
+        if self.deterministic_no_burn:
+            rng = np.random.default_rng(self.no_burn_seed + index)
+            return bool(rng.random() < self.no_burn_probability)
+
+        return bool(np.random.random() < self.no_burn_probability)
 
     def _load_frames(self, sample_dir: Path) -> np.ndarray:
         frame_paths = sorted(
@@ -209,7 +229,10 @@ class BurnRecoveryDataset(Dataset):
         clean = self._load_frames(sample_dir)
         _, h, w = clean.shape
 
-        correction = self._load_burn_trace(sample_dir, (h, w))
+        if self._use_no_burn_sample(index):
+            correction = np.zeros((h, w), dtype=np.float32)
+        else:
+            correction = self._load_burn_trace(sample_dir, (h, w))
         mask = (correction > 0).astype(np.float32)
 
         low, high = self.temporal_scale_range
@@ -431,6 +454,9 @@ def main():
         temporal_scale_range=cfg.temporal_scale_range,
         generate_missing_burn=cfg.generate_missing_burn,
         max_samples=cfg.max_train_samples,
+        no_burn_probability=cfg.train_no_burn_probability,
+        no_burn_seed=cfg.seed,
+        deterministic_no_burn=False,
     )
     val_dataset = BurnRecoveryDataset(
         root=cfg.val_root,
@@ -438,6 +464,9 @@ def main():
         temporal_scale_range=(1.0, 1.0),
         generate_missing_burn=cfg.generate_missing_burn,
         max_samples=None,
+        no_burn_probability=cfg.val_no_burn_probability,
+        no_burn_seed=cfg.val_subset_seed,
+        deterministic_no_burn=True,
     )
     full_val_samples = len(val_dataset)
     val_dataset = make_fixed_random_subset(
@@ -478,6 +507,8 @@ def main():
     print(f"image_size: {cfg.image_size}")
     print(f"batch_size: {cfg.batch_size}")
     print(f"amp: {bool(cfg.use_amp and device.type == 'cuda')}")
+    print(f"train no-burn probability: {cfg.train_no_burn_probability}")
+    print(f"val no-burn probability: {cfg.val_no_burn_probability}")
 
     writer = None
     if cfg.use_tensorboard:
