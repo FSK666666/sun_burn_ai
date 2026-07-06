@@ -26,6 +26,7 @@ C:\Users\17874\Documents\python
 ├── preview_burn_on_training_groups.py   # 合成灼烧标签、预览、自动写入
 ├── burn_recovery_net.py                 # BurnRecoveryNet 网络结构
 ├── train_burn_recovery.py               # 训练脚本
+├── train_small_scale.py                 # 200/100 样本小规模试训脚本
 ├── overfit_single_batch.py              # 固定单 batch 过拟合排查脚本
 ├── test_burn_recovery.py                # 独立评估脚本
 ├── 思路.txt                             # 网络设计思路
@@ -903,10 +904,38 @@ prob_active_mean 与 prob_bg_mean 拉开
    如果单 batch 不能过拟合，不要扩大到完整训练集。
 
 1. 快速调试阶段
-   - `image_size=(256, 320)`
-   - `batch_size=4`
-   - `max_train_samples=500` 可选
-   - 确认 loss 能下降、可视化结果合理。
+   - 推荐先运行 200 个训练样本、100 个固定验证样本的小规模试训：
+
+```powershell
+python train_small_scale.py
+```
+
+   默认配置：
+
+```text
+max_train_samples = 200
+max_val_samples = 100
+batch_size = 6
+epochs = 10
+train_no_burn_probability = 0.15
+val_no_burn_probability = 0.15
+val_generate_missing_burn = False
+c_bg_loss_weight = 1.0
+c_global_loss_weight = 0.5
+```
+
+   重点观察：
+
+```text
+val_dice
+val_active_mae
+val_bg_mae
+prob_active_mean
+prob_bg_mean
+bg_changed
+```
+
+   如果 `val_dice` 上升、`prob_active_mean` 明显高于 `prob_bg_mean`，且 `val_bg_mae` 继续下降，再扩大到更多样本。
 
 2. 正式训练阶段
    - `max_train_samples=None`

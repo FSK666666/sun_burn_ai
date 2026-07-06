@@ -792,8 +792,7 @@ def save_visualizations(
             saved += 1
 
 
-def main():
-    cfg = TrainConfig()
+def train_with_config(cfg: TrainConfig):
     resume_data = None
     if cfg.resume_checkpoint is not None:
         resume_data = torch.load(cfg.resume_checkpoint, map_location="cpu")
@@ -964,6 +963,10 @@ def main():
 
     if writer is not None:
         writer.close()
+
+
+def main():
+    train_with_config(TrainConfig())
 
 
 if __name__ == "__main__":
