@@ -26,6 +26,8 @@ C:\Users\17874\Documents\python
 ├── preview_burn_on_training_groups.py   # 合成灼烧标签、预览、自动写入
 ├── burn_recovery_net.py                 # BurnRecoveryNet 网络结构
 ├── train_burn_recovery.py               # 训练脚本
+├── overfit_single_batch.py              # 固定单 batch 过拟合排查脚本
+├── test_burn_recovery.py                # 独立评估脚本
 ├── 思路.txt                             # 网络设计思路
 └── BURN_RECOVERY_PROJECT.md             # 本文档
 ```
@@ -872,6 +874,33 @@ progress_print_every = 0
 ## 14. 建议的正式实验流程
 
 推荐按三个阶段做：
+
+0. 单 batch 过拟合排查阶段
+
+   使用固定样本、固定标签、无 shuffle、无无灼烧随机样本、无 scheduler、`weight_decay=0`：
+
+```powershell
+python overfit_single_batch.py --samples 6 --batch-size 6 --epochs 300 --image-height 256 --image-width 320
+```
+
+   该脚本会先检查标签：
+
+```text
+mask_ratio
+c_min / c_max / c_mean
+active_c_mean
+```
+
+   并断言背景 correction 为 0、mask 非空。预期趋势是：
+
+```text
+train_dice 逐渐升高
+train_active_mae 逐渐降低
+train_bg_mae 快速接近 0
+prob_active_mean 与 prob_bg_mean 拉开
+```
+
+   如果单 batch 不能过拟合，不要扩大到完整训练集。
 
 1. 快速调试阶段
    - `image_size=(256, 320)`

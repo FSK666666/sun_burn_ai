@@ -150,6 +150,11 @@ class BurnRecoveryNet(nn.Module):
             DepthwiseSeparableConv(c1, c1),
             nn.Conv2d(c1, 1, kernel_size=1),
         )
+        self._init_sparse_output_biases()
+
+    def _init_sparse_output_biases(self):
+        nn.init.constant_(self.prob_head[-1].bias, -4.0)
+        nn.init.constant_(self.correction_head[-1].bias, -4.0)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if x.ndim != 4:

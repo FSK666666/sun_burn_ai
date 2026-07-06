@@ -468,9 +468,11 @@ def compute_metric_sums(
     if active_count > 0:
         active_abs = error[target_mask].sum()
         active_sq = (correction[target_mask] - c_target[target_mask]).pow(2).sum()
+        prob_active_sum = prob[target_mask].sum()
     else:
         active_abs = correction.new_tensor(0.0)
         active_sq = correction.new_tensor(0.0)
+        prob_active_sum = correction.new_tensor(0.0)
 
     bg_count = background.sum().float()
     if bg_count > 0:
@@ -479,15 +481,19 @@ def compute_metric_sums(
         bg_changed_1 = (bg_pred_abs > cfg.background_change_threshold).float().sum()
         bg_changed_2 = (bg_pred_abs > 2.0 * cfg.background_change_threshold).float().sum()
         bg_max = bg_pred_abs.max()
+        prob_bg_sum = prob[background].sum()
     else:
         bg_abs = correction.new_tensor(0.0)
         bg_changed_1 = correction.new_tensor(0.0)
         bg_changed_2 = correction.new_tensor(0.0)
         bg_max = correction.new_tensor(0.0)
+        prob_bg_sum = correction.new_tensor(0.0)
 
     global_abs = error.sum()
     global_count = torch.tensor(error.numel(), device=error.device, dtype=error.dtype)
     max_error = error.max()
+    prob_sum = prob.sum()
+    prob_max = prob.max()
     error_hist = torch.histc(error.detach().float(), bins=256, min=0.0, max=1.0)
 
     result = {
@@ -503,6 +509,10 @@ def compute_metric_sums(
         "bg_changed_1": float(bg_changed_1.detach().cpu()),
         "bg_changed_2": float(bg_changed_2.detach().cpu()),
         "bg_max": float(bg_max.detach().cpu()),
+        "prob_sum": float(prob_sum.detach().cpu()),
+        "prob_max": float(prob_max.detach().cpu()),
+        "prob_active_sum": float(prob_active_sum.detach().cpu()),
+        "prob_bg_sum": float(prob_bg_sum.detach().cpu()),
         "global_abs": float(global_abs.detach().cpu()),
         "global_count": float(global_count.detach().cpu()),
         "max_error": float(max_error.detach().cpu()),
@@ -564,6 +574,10 @@ def finalize_metrics(sums: dict[str, float]) -> dict[str, float]:
         "p95_error": p95_error,
         "max_error": sums.get("max_error", 0.0),
         "bg_max": sums.get("bg_max", 0.0),
+        "prob_mean": 0.0 if global_count <= 0 else sums.get("prob_sum", 0.0) / (global_count + eps),
+        "prob_max": sums.get("prob_max", 0.0),
+        "prob_active_mean": 0.0 if active_count <= 0 else sums.get("prob_active_sum", 0.0) / (active_count + eps),
+        "prob_bg_mean": 0.0 if bg_count <= 0 else sums.get("prob_bg_sum", 0.0) / (bg_count + eps),
     }
 
 
@@ -604,6 +618,19 @@ def run_one_epoch(
         correction = correction.float()
         loss, parts = compute_loss(prob_logits, correction, p_target, c_target, cfg)
         metric_sums = compute_metric_sums(prob, correction, p_target, c_target, cfg)
+        with torch.no_grad():
+            active = p_target > 0.5
+            background = ~active
+            prob_active_mean = (
+                prob[active].mean()
+                if active.any()
+                else prob.new_tensor(0.0)
+            )
+            prob_bg_mean = (
+                prob[background].mean()
+                if background.any()
+                else prob.new_tensor(0.0)
+            )
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -637,7 +664,17 @@ def run_one_epoch(
             phase = "train" if is_train else "val"
             print(
                 f"{phase} batch {batch_idx}/{total_batches} "
-                f"loss={total_loss / max(n_batches, 1):.5f}",
+                f"loss={total_loss / max(n_batches, 1):.5f} "
+                f"focal={parts['focal']:.5f} "
+                f"dice_loss={parts['dice_loss']:.5f} "
+                f"active={parts['l1_active']:.5f} "
+                f"bg={parts['l1_bg']:.5f} "
+                f"global={parts['l1_global']:.5f} "
+                f"grad={parts['gradient']:.5f} "
+                f"prob_mean={float(prob.mean().detach().cpu()):.5f} "
+                f"prob_max={float(prob.max().detach().cpu()):.5f} "
+                f"prob_active={float(prob_active_mean.detach().cpu()):.5f} "
+                f"prob_bg={float(prob_bg_mean.detach().cpu()):.5f}",
                 flush=True,
             )
 
