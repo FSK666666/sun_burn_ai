@@ -25,16 +25,16 @@ SoonminHwang-rgbt-ped-detection-f238a61/
 synthetic_burn_preview/
 
 # Training outputs
-checkpoints/
+
 runs/
-*.pt
+
 *.pth
 *.ckpt
 
 # Large/raw media and downloaded artifacts
 *.jpg
 *.jpeg
-*.png
+
 *.bmp
 *.tif
 *.tiff
